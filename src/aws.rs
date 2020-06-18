@@ -2,11 +2,10 @@
 //use rusoto_sqs;
 
 use rusoto_core::Region;
-use rusoto_sqs::SqsClient;
-use rusoto_sqs::ReceiveMessageRequest;
-use rusoto_sqs::Sqs;
-use core::pin::Pin;
-
+use rusoto_sqs::{ Sqs, SqsClient, ReceiveMessageRequest, ReceiveMessageResult, Message};
+use std::sync::mpsc;
+use std::sync::mpsc::{Sender, Receiver};
+use crate::write_kv::write_to_kv;
 
 
 pub async fn sqs_fetch(queue_url: String) {
@@ -15,48 +14,61 @@ pub async fn sqs_fetch(queue_url: String) {
 
     let sqs = SqsClient::new(region);
 
-    // MESSAGE ATTRIBUTES: 
-    let mut message_attributes = Vec::new();
-    message_attributes.push(String::from("All"));
+    // MESSAGE REQUIRED VALUES: 
     let max_messages = 50;
     let visibility_to = 10;
     let wait_time = 5;
 
-    let message_request = ReceiveMessageRequest {
-        attribute_names: Some(message_attributes),
-        max_number_of_messages: Some(max_messages),
-        message_attribute_names: None,
-        queue_url: queue_url.clone(),
-        receive_request_attempt_id: None,
-        visibility_timeout: Some(visibility_to),
-        wait_time_seconds: Some(wait_time)
+    let (delete_send, delete_recv): (Sender<Message>, Receiver<Message>) = mpsc::channel();
 
-    };
+    let (write_send, write_recv): (Sender<Message>, Receiver<Message>) = mpsc::channel();
 
-    // let message_future_pin = Sqs::receive_message(&sqs, message_request);
+    let kv_writer = std::thread::spawn(move || {
+        write_to_kv(write_recv, delete_send);
+    });
 
-    //let future = sqs.receive_message(message_request).sync();
+    loop {
 
+        let message_attributes = vec![String::from("All")];
 
-    match sqs.receive_message(message_request).await {
-        Ok(output) => {
-            match output.messages {
-                Some(message_list) => {
-                    println!("Messages in list:");
+        let message_request = ReceiveMessageRequest {
+            attribute_names: Some(message_attributes),
+            max_number_of_messages: Some(max_messages),
+            message_attribute_names: None,
+            queue_url: queue_url.clone(),
+            receive_request_attempt_id: None,
+            visibility_timeout: Some(visibility_to),
+            wait_time_seconds: Some(wait_time)
 
-                    for message in message_list {
-                        println!("{}", message.body.unwrap());
-                    }
-                },
-                None => println!("No messages in queue!")
-            }
-        },
-        Err(e) => println!("error retrieving messages: {}", e),
-    }; 
+        };
 
+        let received_messages: Vec<Message>; 
+        
 
-    // let message_future = Pin::into_inner_unchecked(message_future_pin);
+        match sqs.receive_message(message_request).await {
+            Ok(output) => {
+                match output.messages {
+                    Some(message_list) => {
+                        println!("Messages received");
 
+                        for message in message_list {
+                            write_send.send(message);
+                        }
+                    },
+                    None => println!("No messages in queue!")
+                }
+            },
+            Err(e) => println!("error retrieving messages: {}", e),
+        };
+
+        let to_delete_iter = delete_recv.iter();
+
+        for message in to_delete_iter {
+            println!("Deleted message: {}", message.body.unwrap());
+            // !! TODO: Actually delete 
+        }
+
+    }
 
     
     let mut x = 0;
